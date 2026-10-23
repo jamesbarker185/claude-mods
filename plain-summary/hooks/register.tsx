@@ -186,6 +186,11 @@ async function chosenModel($: EngineInterface): Promise<string> {
   return typeof stored === 'string' && MODELS.includes(stored) ? stored : DEFAULT_MODEL
 }
 
+// Like the chat, the pane follows its bottom: "end" keeps up as the tree grows, until the person scrolls.
+function followNewest($: EngineInterface) {
+  void $.ui.scroll({ in: PANE, to: 'end' }).catch(() => undefined)
+}
+
 async function summarize($: EngineInterface, id: string) {
   const fold = (await read($, folds)).find(one => one.id === id)
   if (fold === undefined) return
@@ -204,6 +209,7 @@ async function summarize($: EngineInterface, id: string) {
       .catch(() => undefined)
     const summary = (reply?.isAnswered ? parse(reply.text, fold, model, at) : undefined) ?? fallback(fold, model, at)
     await changeFold($, id, one => ({ ...one, summary }))
+    followNewest($)
   } finally {
     await update($, summarizing, list => list.filter(one => one !== id))
   }
@@ -267,7 +273,7 @@ export const register: Register = on => {
       argumentHint: '[now | model <name>]',
     })
     await restore($)
-    void $.ui.open({ id: PANE, title: TITLE })
+    void $.ui.open({ id: PANE, title: TITLE }).then(() => followNewest($))
 
     return next(e)
   })
@@ -302,6 +308,7 @@ export const register: Register = on => {
     // The newest fold opens by default, so a new one clears any choice made on it.
     await update($, closed, list => list.filter(one => one !== fold.id))
     scheduleSave($)
+    followNewest($)
 
     return result
   }).catch(($, e, next) => next(e))
@@ -398,7 +405,7 @@ export const register: Register = on => {
       const steps = group.tools.map(i => fold.steps[i]).filter((s): s is Step => s !== undefined)
 
       return (
-        <Box key={`g-${key}`} flexDirection="column" gap={1}>
+        <Box key={`g-${key}`} flexDirection="column">
           <Box flexDirection="row" gap={1}>
             <Button key={`gb-${key}`} plain onPress={() => update($, openGroups, l => toggleIn(l, key))}>
               <Text color={isProblem ? 'error' : 'success'}>{isProblem ? '!' : '✓'}</Text>
@@ -416,8 +423,9 @@ export const register: Register = on => {
               </Text>
             </Box>
           )}
+          {/* A group's steps sit in a bordered box under it, so each step reads as that group's child. */}
           {isGroupOpen && (
-            <Box flexDirection="column" paddingLeft={4} gap={1}>
+            <Box flexDirection="column" marginLeft={2} marginTop={1} paddingX={1} gap={1} borderStyle="single" borderDimColor>
               {steps.map(step => (
                 <Box key={`s-${step.id}`} flexDirection="column">
                   <Text wrap="wrap">
@@ -443,12 +451,14 @@ export const register: Register = on => {
       )
     }
 
+    // A fold reads like the chat: your words on top, Claude's work under them, the result last.
     const foldView = (fold: Fold) => {
       const isFoldOpen = isOpen(fold)
+      const isNewest = fold.id === newest?.id
       const summary = fold.summary
       const isBusy = busy.includes(fold.id)
       const latest = fold.steps[fold.steps.length - 1]
-      const problem = summary?.groups.find(g => g.status !== 'ok')
+      const problems = summary?.groups.filter(g => g.status !== 'ok') ?? []
       const originalKey = `original:${fold.id}`
       const original = fold.says.map(say => say.text).join('\n\n')
       const status = fold.isWorking
@@ -462,11 +472,24 @@ export const register: Register = on => {
               : ''
 
       return (
-        <Box key={`f-${fold.id}`} flexDirection="column" marginBottom={2} gap={1}>
+        <Box
+          key={`f-${fold.id}`}
+          flexDirection="column"
+          gap={1}
+          paddingX={1}
+          borderStyle="round"
+          borderColor={isNewest ? 'claude' : undefined}
+          borderDimColor={!isNewest}
+        >
+          {isNewest && (
+            <Text size="caption" color="claude">
+              Since your last message
+            </Text>
+          )}
           <Box flexDirection="row" gap={1}>
             <Button key={`fb-${fold.id}`} plain onPress={() => toggleFold(fold)}>
               <Text dimColor>{`${clockTime(fold.at)} `}</Text>
-              <Text color={fold.id === newest?.id ? 'claude' : 'text'}>{GLYPH[fold.kind]}</Text>
+              <Text color={isNewest ? 'claude' : 'text'}>{GLYPH[fold.kind]}</Text>
               <Text dimColor>{isFoldOpen ? ' ▾' : ' ▸'}</Text>
             </Button>
             <Box flexShrink={1}>
@@ -475,23 +498,15 @@ export const register: Register = on => {
               </Text>
             </Box>
           </Box>
-          <Box flexDirection="column" paddingLeft={4}>
-            {fold.id === newest?.id && (
-              <Text size="caption" color="claude">
-                Since your last message
-              </Text>
-            )}
-            {status !== '' && (
-              <Text dimColor={fold.isWorking || isBusy} wrap="wrap">
-                {status}
-              </Text>
-            )}
-            {problem !== undefined && <Text color="error">{problem.status}</Text>}
-          </Box>
-          {isFoldOpen && summary !== undefined && (
-            <Box flexDirection="column" paddingLeft={4} gap={1}>
-              {summary.groups.map((group, gi) => groupView(fold, group, gi))}
-              {summary.reply.length > 0 && (
+          {/* Claude's part of the fold hangs off a rail, indented under your words. */}
+          {isFoldOpen && (summary !== undefined || fold.steps.length > 0) && (
+            <Box flexDirection="column" marginLeft={2} paddingLeft={1} gap={1} borderStyle="single" borderDimColor>
+              {summary !== undefined && summary.groups.map((group, gi) => groupView(fold, group, gi))}
+              {summary === undefined &&
+                fold.steps.slice(-5).map(step => (
+                  <Text key={`ls-${step.id}`} dimColor wrap="wrap">{`${clockTime(step.at)}  ${step.label}`}</Text>
+                ))}
+              {summary !== undefined && summary.reply.length > 0 && (
                 <Box flexDirection="column" gap={1}>
                   <Text dimColor size="caption">
                     Claude replied
@@ -503,7 +518,7 @@ export const register: Register = on => {
                   ))}
                 </Box>
               )}
-              {original !== '' && (
+              {summary !== undefined && original !== '' && (
                 <Box flexDirection="column" gap={1}>
                   <Button key={`ob-${fold.id}`} plain onPress={() => toggleShown(originalKey)}>
                     <Text color="suggestion">{shown.includes(originalKey) ? 'Hide full reply' : 'Show full reply'}</Text>
@@ -513,28 +528,36 @@ export const register: Register = on => {
               )}
             </Box>
           )}
-          {isFoldOpen && summary === undefined && fold.steps.length > 0 && (
-            <Box flexDirection="column" paddingLeft={4}>
-              {fold.steps.slice(-5).map(step => (
-                <Text key={`ls-${step.id}`} dimColor wrap="wrap">{`${clockTime(step.at)}  ${step.label}`}</Text>
-              ))}
+          {status !== '' && (
+            <Box flexDirection="column">
+              <Text dimColor={fold.isWorking || isBusy} wrap="wrap">
+                {status}
+              </Text>
+              {problems.length > 0 && (
+                <Text color="error" size="caption">
+                  {problems.length === 1
+                    ? `One part ${problems[0]?.status === 'blocked' ? 'was blocked' : 'failed'}: ${problems[0]?.title ?? ''}`
+                    : `${problems.length} parts failed or were blocked`}
+                </Text>
+              )}
             </Box>
           )}
         </Box>
       )
     }
 
+    // Oldest at the top, newest at the bottom, with the controls under it: the order of the chat.
     return (
       <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="flex-end">
-          {list.length > 0 && (
+        {list.length === 0 && <Text dimColor>Your next message starts the timeline.</Text>}
+        {list.map(foldView)}
+        {list.length > 1 && (
+          <Box flexDirection="row" justifyContent="flex-end">
             <Button key="all" plain onPress={toggleAll}>
               <Text color="suggestion">{allOpen ? 'Fold all' : 'Open all'}</Text>
             </Button>
-          )}
-        </Box>
-        {list.length === 0 && <Text dimColor>Your next message starts the timeline.</Text>}
-        {list.map(foldView)}
+          </Box>
+        )}
       </Box>
     )
   })
