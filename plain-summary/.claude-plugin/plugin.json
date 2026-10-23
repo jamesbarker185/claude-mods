@@ -1,6 +1,6 @@
 {
   "name": "plain-summary",
-  "version": "0.2.0",
-  "description": "A side pane that explains what Claude does in Simplified Technical English, outside the main context",
+  "version": "0.3.0",
+  "description": "A side pane that folds each thing you did and what Claude did after it into one plain line",
   "types": "./types/index.d.ts"
 }

@@ -1,4 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+import type { ModelCompleteResult, On } from 'claude-code'
 
 const PANE = {
   plugin: 'plain-summary',
@@ -7,113 +9,161 @@ const PANE = {
   props: {
     title: 'Plain summary',
     isFocused: false,
-    bodyColumns: 50,
+    bodyColumns: 60,
     placement: 'dock',
     scroll: { offset: 0, bodyRows: 40 },
     view: {},
   },
 } as const
 
-const USAGE = {
-  input_tokens: 1,
-  output_tokens: 1,
-  cache_creation_input_tokens: 0,
-  cache_read_input_tokens: 0,
+const SUMMARY = JSON.stringify({
+  outcome: 'Neither PR merged. A safety check blocked it.',
+  groups: [
+    { title: 'Checked both PRs', status: 'ok', tools: [0] },
+    { title: 'Tried to merge both PRs', status: 'blocked', note: 'No review on either PR.', tools: [1] },
+  ],
+  reply: ['You must merge each PR yourself.'],
+  terms: [{ term: 'PR', meaning: 'A request to add changes to a project.' }],
+})
+
+// Everything beneath the plugin: each hook here stands for the engine.
+// A null model text stands for a model call that fails.
+function engine(on: On, modelText: string | null = SUMMARY) {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  const calls = { model: 0 }
+  on('command.register', () => ({ value: { command: 'plain' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 's1' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('turn.complete', () => ({ text: '' }))
+  on('tool.call', () => ({ result: {}, text: 'ok' }))
+  on('model.complete', () => {
+    calls.model += 1
+    // Only the fields the plugin reads; usage is not one of them.
+    const value = (
+      modelText === null
+        ? { isAnswered: false, reason: 'api-error', status: 500, error: 'server_error' }
+        : { isAnswered: true, text: modelText }
+    ) as ModelCompleteResult
+    return { value }
+  })
+
+  return { clock, calls }
 }
 
-test('a turn shows plain steps, then a summary, on every surface', async ($, on) => {
-  // Each hook here stands for the engine beneath the plugin.
-  const clock = mock.clock(on)
-  const forks: string[] = []
-  on('command.register', () => ({ value: { command: 'plain' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('tool.call', () => ({ result: {} }))
-  on('turn.complete', () => ({ text: '' }))
-  on('model.complete', () => ({
-    value: { isAnswered: true, text: '1. Reads the login file to find the password check.', usage: USAGE },
-  }))
-  on('model.fork', (_, e) => {
-    forks.push(e.prompt)
-
-    return { value: { isAnswered: true, text: '**You asked:** fix the login.', usage: USAGE } }
+async function say($: Engine, text: string, uuid: string) {
+  await $.session.append({
+    message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text }] },
+    door: 'response',
+    origin: { kind: 'model', model: 'test' },
+    uuid,
   })
+}
 
+async function finish($: Engine, clock: { advance: (ms: number) => Promise<void> }) {
+  await $.turn.complete({ turnId: 't', answer: '', durationMs: 1, isAborted: false, reason: 'answer' })
+  await clock.advance(500)
+}
+
+async function pane($: Engine, surface: 'terminal' | 'desktop') {
+  return $.ui.mount({ ...PANE, surface })
+}
+
+test('each message of yours starts a fold; notifications and reminders do not', async ($, on) => {
+  const { clock } = engine(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.turn.start({ text: 'fix the login', turnId: 't1' })
-  await $.tool.call({ tool: 'Read', file_path: '/app/login.ts' })
-  await clock.advance(2000)
-  await $.turn.complete({ answer: 'Done. '.repeat(200), turnId: 't1', durationMs: 1, isAborted: false, reason: 'answer' })
-  await clock.advance(1000)
 
-  expect(forks.length).toBe(1)
-  expect(forks[0]).toContain('Simplified Technical English')
+  await $.prompt.submit({ text: 'Merge both PRs please', origin: { kind: 'composer' }, wait: false })
+  await $.prompt.submit({ text: '<task-notification>done</task-notification>', origin: { kind: 'task-notification' }, wait: false })
+  await $.prompt.submit({ text: '<bash-input>gh pr merge 466</bash-input><bash-stdout>Merged</bash-stdout>', origin: { kind: 'sdk' }, wait: false })
+  await $.prompt.submit({ text: '<system-reminder>internal</system-reminder>', origin: { kind: 'sdk' }, wait: false })
+  await clock.advance(10)
 
-  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
-    const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /Reads the login file/ }))?.text).toContain('Reads the login file')
-    expect(await ui.find({ type: 'Markdown', text: /fix the login/ })).toBeDefined()
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await pane($, surface)
+    expect(await ui.find({ type: 'Text', text: /Merge both PRs please/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /You ran a command: gh pr merge 466/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /task-notification|internal/ })).toBeFalsy()
     await ui.unmount()
   }
-
-  // The timeline lists the turn, then its step, each with a time.
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-timeline' })
-  expect((await ui.find({ type: 'Text', text: /You: fix the login/ }))?.text).toBe('You: fix the login')
-  expect(await ui.find({ type: 'Text', text: /^\d\d:\d\d:\d\d$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Button', key: 'read-t1' })).toBeDefined()
-  await ui.unmount()
 })
 
-test('a small chat turn gets no summary', async ($, on) => {
-  const clock = mock.clock(on)
-  let forks = 0
-  on('command.register', () => ({ value: { command: 'plain' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('turn.complete', () => ({ text: '' }))
-  on('model.fork', () => {
-    forks += 1
-
-    return { value: { isAnswered: true, text: 'x', usage: USAGE } }
-  })
-
+test('a finished fold shows its outcome, and a blocked group opens itself', async ($, on) => {
+  const { clock, calls } = engine(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.turn.start({ text: 'hi', turnId: 't1' })
-  await $.turn.complete({ answer: 'Hello!', turnId: 't1', durationMs: 1, isAborted: false, reason: 'answer' })
-  await clock.advance(1000)
+  await $.prompt.submit({ text: 'Merge both PRs', origin: { kind: 'composer' }, wait: false })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr view 466', description: 'Check PR 466' })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 466', description: 'Merge PR 466' })
+  await say($, 'I could not merge. Auto mode blocked it because there is no review. You must merge each PR yourself.', 'row-1')
+  await finish($, clock)
 
-  expect(forks).toBe(0)
-})
-
-test('a restarted session gets its saved history back', async ($, on) => {
-  const disk: Record<string, unknown> = {
-    'history:s1': {
-      steps: [{ id: 'a', turnId: 't0', raw: 'Read: x', plain: 'Reads the saved file.', isHelper: false, at: 0 }],
-      summaries: [{ turnId: 't0', ask: 'old ask', text: '**You asked:** the old thing.', at: 0 }],
-      turns: [{ id: 't0', ask: 'old ask', steps: 1, at: 0 }],
-    },
+  expect(calls.model).toBe(1)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await pane($, surface)
+    expect(await ui.find({ type: 'Text', text: /→ Neither PR merged/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /No review on either PR/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /You must merge each PR yourself/ })).toBeTruthy()
+    await ui.unmount()
   }
-  on('session.id', () => ({ value: 's1' }))
-  on('store.get', (_, e) => ({ value: disk[e.key] }))
-  on('store.set', (_, e) => {
-    disk[e.key] = e.value
+})
 
-    return { value: undefined }
-  })
-  on('store.delete', () => ({ value: undefined }))
-  on('command.register', () => ({ value: { command: 'plain' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('session.start', (_, e) => ({ cwd: e.cwd }))
-
+test('a short chat answer is summarised without a model call', async ($, on) => {
+  const { clock, calls } = engine(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  expect(disk.sessions).toEqual(['s1'])
+  await $.prompt.submit({ text: 'what model is used?', origin: { kind: 'composer' }, wait: false })
+  await say($, 'Haiku writes the summaries. You can change it with a command.', 'row-2')
+  await finish($, clock)
 
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Markdown', text: /the old thing/ })).toBeDefined()
-  await ui.press({ key: 'tab-timeline' })
-  expect((await ui.find({ type: 'Text', text: /Reads the saved file/ }))?.text).toBe('Reads the saved file.')
+  expect(calls.model).toBe(0)
+  const ui = await pane($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: /→ Haiku writes the summaries\./ })).toBeTruthy()
   await ui.unmount()
+})
+
+test('a model that fails falls back to Claude\'s own first sentence', async ($, on) => {
+  const { clock } = engine(on, null)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'run the tests', origin: { kind: 'composer' }, wait: false })
+  await $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Run the tests' })
+  await say($, 'All 12 tests pass. Nothing else changed.', 'row-3')
+  await finish($, clock)
+
+  const ui = await pane($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: /→ All 12 tests pass\./ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('only the newest fold is open; Open all opens the rest', async ($, on) => {
+  const { clock } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'first ask', origin: { kind: 'composer' }, wait: false })
+  await $.tool.call({ tool: 'Bash', command: 'ls', description: 'List files' })
+  await say($, 'Listed the files. There are three of them in the folder now.', 'row-4')
+  await finish($, clock)
+  await $.prompt.submit({ text: 'second ask', origin: { kind: 'composer' }, wait: false })
+  await $.tool.call({ tool: 'Bash', command: 'pwd', description: 'Show folder' })
+  await say($, 'You are in the project folder. Nothing else changed in it.', 'row-5')
+  await finish($, clock)
+
+  const ui = await pane($, 'desktop')
+  // The groups of a fold show only when it is open; the model answer names "Checked both PRs".
+  const before = await ui.findAll({ type: 'Text', text: /You must merge each PR yourself/ })
+  expect(before.length).toBe(1)
+  await ui.press({ key: 'all' })
+  const after = await ui.findAll({ type: 'Text', text: /You must merge each PR yourself/ })
+  expect(after.length).toBe(2)
+  await ui.unmount()
+})
+
+test('/plain model stores the choice', async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const run = (args: string) =>
+    $.command.run({ command: 'plain', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+  const set = await run('model sonnet')
+  expect(set.text).toBe('New summaries use sonnet.')
+  const bad = await run('model gpt')
+  expect(bad.text).toMatch(/Summary model: sonnet/)
 })

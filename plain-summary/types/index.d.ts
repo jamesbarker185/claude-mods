@@ -1,34 +1,55 @@
+export type FoldKind = 'msg' | 'ran' | 'task'
+
 export type Step = {
   id: string
-  turnId: string
-  raw: string
-  plain?: string
+  tool: string
+  label: string
+  args: string
+  result?: string
+  isError?: boolean
   isHelper: boolean
   at: number
 }
 
+export type Say = { text: string; rowId?: string; at: number }
+
+export type GroupStatus = 'ok' | 'blocked' | 'failed'
+
+export type Group = { title: string; status: GroupStatus; note?: string; tools: number[] }
+
+export type Term = { term: string; meaning: string }
+
 export type Summary = {
-  turnId: string
-  ask: string
-  text: string
+  outcome: string
+  groups: Group[]
+  reply: string[]
+  terms: Term[]
+  model: string
   at: number
+  isFallback?: boolean
 }
 
-export type Turn = { id: string; ask: string; steps: number; at: number }
-
-export type Tab = 'summary' | 'timeline'
+export type Fold = {
+  id: string
+  kind: FoldKind
+  at: number
+  you: string
+  rowId?: string
+  steps: Step[]
+  says: Say[]
+  isWorking: boolean
+  summary?: Summary
+}
 
 declare module 'claude-code' {
   interface PluginState {
     'plain-summary': {
-      steps: Step[]
-      summaries: Summary[]
-      turn: Turn | null
-      turns: Turn[]
-      isSummarizing: boolean
-      shown: number
-      tab: Tab
-      timelineTurns: number
+      folds: Fold[]
+      summarizing: string[]
+      opened: string[]
+      closed: string[]
+      openGroups: string[]
+      shownCmds: string[]
     }
   }
 }

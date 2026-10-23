@@ -1,83 +1,215 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Step, Summary, Tab, Turn } from '../types'
+import type { Fold, FoldKind, Group, Say, Step, Summary } from '../types'
 
 const PANE = 'plain-summary'
 const TITLE = 'Plain summary'
-// How many turns the timeline shows at first, and how many more "Show older" adds.
-const TIMELINE_PAGE = 5
 
-const steps = atom({ plugin: 'plain-summary', key: 'steps' } as const, [])
-const summaries = atom({ plugin: 'plain-summary', key: 'summaries' } as const, [])
-const turn = atom({ plugin: 'plain-summary', key: 'turn' } as const, null)
-const turns = atom({ plugin: 'plain-summary', key: 'turns' } as const, [])
-const isSummarizing = atom({ plugin: 'plain-summary', key: 'isSummarizing' } as const, false)
-const shown = atom({ plugin: 'plain-summary', key: 'shown' } as const, 0)
-const tab = atom({ plugin: 'plain-summary', key: 'tab' } as const, 'summary' as Tab)
-const timelineTurns = atom({ plugin: 'plain-summary', key: 'timelineTurns' } as const, TIMELINE_PAGE)
+const folds = atom({ plugin: 'plain-summary', key: 'folds' } as const, [])
+const summarizing = atom({ plugin: 'plain-summary', key: 'summarizing' } as const, [])
+const opened = atom({ plugin: 'plain-summary', key: 'opened' } as const, [])
+const closed = atom({ plugin: 'plain-summary', key: 'closed' } as const, [])
+const openGroups = atom({ plugin: 'plain-summary', key: 'openGroups' } as const, [])
+const shownCmds = atom({ plugin: 'plain-summary', key: 'shownCmds' } as const, [])
 
-// The live feed: a cheap model turns each raw tool call into one plain line.
-const NARRATOR = 'haiku'
-const NARRATE_DELAY_MS = 1500
-// A turn this small (no tool calls, a short answer) gets no summary of its own.
+const DEFAULT_MODEL = 'haiku'
+const MODELS = ['haiku', 'sonnet', 'opus']
+// A fold this small (no tool calls, a short answer) gets no model call.
 const SMALL_ANSWER = 600
-
-const STE_RULES = `Write in ASD-STE100 Simplified Technical English:
-- Short sentences, 20 words at most. One fact per sentence.
-- Active voice. Present or past tense. Common words.
-- The reader is learning to code. Explain, do not show off.`
-
-const SUMMARY_PROMPT = `Stop. Do not continue the task and do not use tools.
-Write a short summary for the user of your most recent turn only (from the user's last message to your last answer).
-
-${STE_RULES}
-
-Use this Markdown layout and nothing else:
-
-**You asked:** one sentence.
-
-**What I did**
-1. Up to 6 numbered steps, each one sentence.
-
-**Why:** 1 to 3 sentences about the reasons for the approach.
-
-**Result:** what changed, what works, and what is not done or not checked.
-
-**Words to know**
-- **term**: one plain sentence. Give 2 to 4 technical terms from this turn. Leave this section out if there are none.
-
-No code blocks longer than 3 lines.`
-
-// The tool fields worth showing before the narrator has written its line.
-const TARGET_FIELDS = ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'description', 'prompt', 'skill']
-const ENVELOPE_FIELDS = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta'])
-
-function rawLine(e: Record<string, unknown>): string {
-  const tool = String(e.tool)
-  const target = TARGET_FIELDS.map(field => e[field]).find(value => typeof value === 'string')
-
-  return target === undefined ? tool : `${tool}: ${String(target).replace(/\s+/g, ' ').slice(0, 120)}`
-}
-
-function toolArgs(e: Record<string, unknown>): string {
-  const args = Object.fromEntries(Object.entries(e).filter(([field]) => !ENVELOPE_FIELDS.has(field)))
-
-  return JSON.stringify(args).slice(0, 400)
-}
-
-// 24-hour local time, so every row of the timeline lines up.
-function clockTime(ms: number): string {
-  const d = new Date(ms)
-
-  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':')
-}
-
-// History is saved to the mod's store (a file on disk) per session, so it
-// survives an app restart. Only the most recent sessions are kept.
+const MAX_INPUT = 60000
+const KEEP_FOLDS = 200
 const KEEP_SESSIONS = 20
 const SAVE_DELAY_MS = 1000
-type Saved = { steps: Step[]; summaries: Summary[]; turns: Turn[] }
+
+const SYSTEM = `You summarise one stretch of a coding session for a person who is learning to code.
+The stretch starts with what the user did and holds everything the AI assistant did until the user's next message.
+Write in ASD-STE100 Simplified Technical English: short sentences (at most 15 words), active voice, common words, one fact per sentence.
+Read less, know more: say only what the user needs to keep up. Never invent facts that are not in the input.
+Fidelity rule: keep every warning, prohibition and instruction to the user with the same meaning and polarity as the source.
+If the assistant tells the user to do something, the reply says to do it. If it tells the user not to do something, the reply says not to.
+Keep direct instructions to the user close to the source wording. Do not add safety advice of your own.
+
+Answer with one JSON object and nothing else:
+{"outcome": string, "groups": [{"title": string, "status": "ok"|"blocked"|"failed", "note"?: string, "tools": number[]}], "reply": string[]}
+- outcome: one line, at most 12 words: what came of this stretch. Say if something failed or is not done.
+- groups: tool calls grouped by purpose, in order, at most 5. Empty if there were no tool calls. title: at most 8 words, starts with a past-tense verb. note: only if blocked or failed, why, one sentence. tools: indexes of the tool calls in the group.
+- reply: 1 to 3 lines: the assistant's message to the user, rewritten in STE. Keep anything the user must do or decide.`
+
+// --- what the user did ---------------------------------------------------
+
+const HUMAN_ORIGINS = new Set(['composer', 'sdk', 'bridge'])
+
+type Classified = { kind: FoldKind; you: string } | undefined
+
+function classify(text: string): Classified {
+  const bash = text.match(/<bash-input>([\s\S]*?)<\/bash-input>/)
+  if (bash) return { kind: 'ran', you: `You ran a command: ${(bash[1] ?? '').trim()}` }
+  const task = text.match(/started your suggested background task[^(]*\("([^"]+)"\)/)
+  if (task) return { kind: 'task', you: `You started a side task: ${task[1] ?? ''}` }
+  const you = cleanText(text)
+  if (you === '') return undefined
+
+  return { kind: 'msg', you }
+}
+
+function cleanText(text: string): string {
+  return text
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/<pasted_content[^>]*>[\s\S]*?<\/pasted_content>/g, '[pasted text]')
+    .replace(/<bash-(stdout|stderr)>[\s\S]*?<\/bash-\1>/g, '')
+    .replace(/<\/?[a-z][\w-]*(\s[^>]*)?>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// --- recording -----------------------------------------------------------
+
+const LABEL_FIELDS = ['description', 'file_path', 'path', 'pattern', 'query', 'url', 'skill']
+const ENVELOPE_FIELDS = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta'])
+
+function stepLabel(e: Record<string, unknown>): string {
+  const tool = String(e.tool)
+  const field = LABEL_FIELDS.find(name => typeof e[name] === 'string')
+  if (field === undefined) return tool
+  const value = String(e[field])
+  const shown = field === 'description' ? value : value.split('/').pop() ?? value
+
+  return field === 'description' ? shown : `${tool} ${shown}`
+}
+
+function stepArgs(e: Record<string, unknown>): string {
+  const args = Object.fromEntries(Object.entries(e).filter(([name]) => !ENVELOPE_FIELDS.has(name)))
+  if (typeof args.command === 'string') return args.command
+
+  return JSON.stringify(args, null, 1).slice(0, 1200)
+}
+
+function textOf(content: readonly unknown[]): string {
+  return content
+    .map(block => (block as { type?: string; text?: string }))
+    .filter(block => block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n')
+    .trim()
+}
+
+async function current($: EngineInterface): Promise<Fold | undefined> {
+  const list = await read($, folds)
+
+  return list[list.length - 1]
+}
+
+async function changeFold($: EngineInterface, id: string, change: (fold: Fold) => Fold) {
+  await update($, folds, list => list.map(fold => (fold.id === id ? change(fold) : fold)))
+  scheduleSave($)
+}
+
+// --- summarising ---------------------------------------------------------
+
+function foldText(fold: Fold): string {
+  type Event = { at: number; line: string }
+  const events: Event[] = [
+    ...fold.steps.map((step, i): Event => ({
+      at: step.at,
+      line: `[tool ${i}] ${step.isHelper ? '(helper agent) ' : ''}${step.tool} ${step.args.slice(0, 400)}${
+        step.result ? `\n  result: ${step.result.slice(0, 300)}` : ''
+      }`,
+    })),
+    ...fold.says.map((say): Event => ({ at: say.at, line: `ASSISTANT SAYS: ${say.text.slice(0, 6000)}` })),
+  ].sort((a, b) => a.at - b.at)
+  const head = `USER (${fold.kind === 'ran' ? 'ran a shell command' : fold.kind === 'task' ? 'started a side task' : 'message'}): ${fold.you}`
+
+  return [head, '', ...events.map(event => event.line)].join('\n').slice(0, MAX_INPUT)
+}
+
+function sentences(text: string): string[] {
+  return cleanText(text.replace(/[`*_#>]/g, ''))
+    .split(/(?<=[.!?])\s+/)
+    .map(s => s.trim())
+    .filter(s => s !== '')
+}
+
+function fallback(fold: Fold, model: string, at: number): Summary {
+  const said = sentences(fold.says.map(say => say.text).join(' '))
+  const byTool = new Map<string, number[]>()
+  fold.steps.forEach((step, i) => byTool.set(step.tool, [...(byTool.get(step.tool) ?? []), i]))
+  const groups: Group[] = [...byTool].map(([tool, tools]) => ({
+    title: `Used ${tool}`,
+    status: tools.some(i => fold.steps[i]?.isError === true) ? 'failed' : 'ok',
+    tools,
+  }))
+
+  return {
+    outcome: (said[0] ?? 'No reply.').slice(0, 120),
+    groups: groups.slice(0, 5),
+    reply: said.slice(0, 3).map(s => s.slice(0, 240)),
+    terms: [],
+    model,
+    at,
+    isFallback: true,
+  }
+}
+
+function parse(text: string, fold: Fold, model: string, at: number): Summary | undefined {
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return undefined
+  try {
+    const raw = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
+    if (typeof raw.outcome !== 'string') return undefined
+    const groups = (Array.isArray(raw.groups) ? raw.groups : [])
+      .map(g => g as Record<string, unknown>)
+      .filter(g => typeof g.title === 'string')
+      .map(
+        (g): Group => ({
+          title: String(g.title),
+          status: g.status === 'blocked' || g.status === 'failed' ? g.status : 'ok',
+          note: typeof g.note === 'string' && g.note !== '' ? g.note : undefined,
+          tools: (Array.isArray(g.tools) ? g.tools : []).filter(
+            (i): i is number => typeof i === 'number' && i >= 0 && i < fold.steps.length,
+          ),
+        }),
+      )
+      .slice(0, 5)
+    const reply = (Array.isArray(raw.reply) ? raw.reply : []).filter((l): l is string => typeof l === 'string').slice(0, 3)
+
+    return { outcome: raw.outcome, groups, reply, terms: [], model, at }
+  } catch {
+    return undefined
+  }
+}
+
+async function chosenModel($: EngineInterface): Promise<string> {
+  const stored = await $.store.get('model')
+
+  return typeof stored === 'string' && MODELS.includes(stored) ? stored : DEFAULT_MODEL
+}
+
+async function summarize($: EngineInterface, id: string) {
+  const fold = (await read($, folds)).find(one => one.id === id)
+  if (fold === undefined) return
+  const model = await chosenModel($)
+  const at = await $.clock.now()
+  const saidLength = fold.says.reduce((n, say) => n + say.text.length, 0)
+  if (fold.steps.length === 0 && saidLength < SMALL_ANSWER) {
+    await changeFold($, id, one => ({ ...one, summary: { ...fallback(one, 'none', at), isFallback: false } }))
+    return
+  }
+  await update($, summarizing, list => [...list.filter(one => one !== id), id])
+  try {
+    // A failed or garbled answer falls back to Claude's own words; the fold never shows an error.
+    const reply = await $.model
+      .complete({ model, system: SYSTEM, prompt: foldText(fold), maxTokens: 2000, effort: 'low' })
+      .catch(() => undefined)
+    const summary = (reply?.isAnswered ? parse(reply.text, fold, model, at) : undefined) ?? fallback(fold, model, at)
+    await changeFold($, id, one => ({ ...one, summary }))
+  } finally {
+    await update($, summarizing, list => list.filter(one => one !== id))
+  }
+}
+
+// --- saving ----------------------------------------------------------------
 
 let historyKey: string | undefined
 let saveTimer: { cancel: () => void } | undefined
@@ -91,12 +223,13 @@ async function restore($: EngineInterface) {
   await $.store.set('sessions', kept.slice(-KEEP_SESSIONS))
 
   // A hot reload keeps the session's state; only an empty one is filled from disk.
-  if ((await read($, turns)).length > 0) return
-  const saved = (await $.store.get(historyKey)) as Saved | undefined
-  if (saved === undefined) return
-  await update($, steps, () => saved.steps)
-  await update($, summaries, () => saved.summaries)
-  await update($, turns, () => saved.turns)
+  if ((await read($, folds)).length > 0) return
+  const saved = (await $.store.get(historyKey)) as { folds?: Fold[]; opened?: string[]; closed?: string[] } | undefined
+  const savedFolds = saved?.folds
+  if (saved === undefined || !Array.isArray(savedFolds)) return
+  await update($, folds, () => savedFolds.map(fold => ({ ...fold, isWorking: false })))
+  await update($, opened, () => saved.opened ?? [])
+  await update($, closed, () => saved.closed ?? [])
 }
 
 function scheduleSave($: EngineInterface) {
@@ -107,83 +240,31 @@ function scheduleSave($: EngineInterface) {
 async function save($: EngineInterface) {
   saveTimer = undefined
   if (historyKey === undefined) return
-  const saved: Saved = { steps: await read($, steps), summaries: await read($, summaries), turns: await read($, turns) }
-  await $.store.set(historyKey, saved)
+  await $.store.set(historyKey, { folds: await read($, folds), opened: await read($, opened), closed: await read($, closed) })
 }
 
-// Module variables start over on a reload; only the narrator's guard lives here.
-let isNarrating = false
-let narrateTimer: { cancel: () => void } | undefined
-const argsById = new Map<string, string>()
+// --- helpers for drawing --------------------------------------------------
 
-async function narrate($: EngineInterface) {
-  narrateTimer = undefined
-  if (isNarrating) return
-  isNarrating = true
-  try {
-    const pending = (await read($, steps)).filter(step => step.plain === undefined).slice(-12)
-    if (pending.length === 0) return
-    const current = await read($, turn)
-    const list = pending
-      .map((step, i) => `${i + 1}. ${step.isHelper ? '(helper agent) ' : ''}${argsById.get(step.id) ?? step.raw}`)
-      .join('\n')
-    const reply = await $.model.complete({
-      model: NARRATOR,
-      effort: 'low',
-      maxTokens: 600,
-      system: `You narrate what an AI coding assistant is doing, for a person who is learning to code.\n${STE_RULES}`,
-      prompt: `The user asked: ${(current?.ask ?? '').slice(0, 500)}\n\nThe assistant just made these tool calls:\n${list}\n\nFor each call, write one plain sentence that says what the assistant does and, if clear, why. Begin with a verb ("Reads", "Runs", "Changes"). Answer with exactly ${pending.length} lines, numbered like the input, nothing else.`,
-    })
-    const lines = reply.isAnswered
-      ? reply.text
-          .split('\n')
-          .map((line: string) => line.trim())
-          .filter((line: string) => /^\d+[.)]/.test(line))
-          .map((line: string) => line.replace(/^\d+[.)]\s*/, ''))
-      : []
-    await update($, steps, list =>
-      list.map(step => {
-        const at = pending.findIndex(one => one.id === step.id)
+function clockTime(ms: number): string {
+  const d = new Date(ms)
 
-        return at < 0 ? step : { ...step, plain: lines[at] ?? step.raw }
-      }),
-    )
-    for (const step of pending) argsById.delete(step.id)
-    scheduleSave($)
-  } finally {
-    isNarrating = false
-  }
-  // Calls that came in while this batch ran get their own batch.
-  if ((await read($, steps)).some(step => step.plain === undefined)) scheduleNarrate($)
+  return [d.getHours(), d.getMinutes()].map(n => String(n).padStart(2, '0')).join(':')
 }
 
-function scheduleNarrate($: EngineInterface) {
-  narrateTimer?.cancel()
-  narrateTimer = $.clock.after(NARRATE_DELAY_MS, () => void narrate($))
+const GLYPH: Record<FoldKind, string> = { msg: '●', ran: '○', task: '■' }
+
+function toggleIn(list: string[], id: string): string[] {
+  return list.includes(id) ? list.filter(one => one !== id) : [...list, id]
 }
 
-async function summarize($: EngineInterface, turnId: string, ask: string) {
-  await update($, isSummarizing, () => true)
-  try {
-    const reply = await $.model.fork({ prompt: SUMMARY_PROMPT })
-    const text = reply.isAnswered
-      ? reply.text.trim()
-      : `_No summary: ${reply.reason}._`
-    const summary: Summary = { turnId, ask, text, at: await $.clock.now() }
-    await update($, summaries, list => [...list, summary].slice(-30))
-    await update($, shown, () => 0)
-    scheduleSave($)
-  } finally {
-    await update($, isSummarizing, () => false)
-  }
-}
+// --- hooks ---------------------------------------------------------------
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'plain',
-      description: 'Open the plain summary pane; "/plain now" summarizes the last turn',
-      argumentHint: '[now]',
+      description: 'Open the plain summary pane; "/plain model haiku|sonnet|opus" sets the model; "/plain now" re-summarises the newest fold',
+      argumentHint: '[now | model <name>]',
     })
     await restore($)
     void $.ui.open({ id: PANE, title: TITLE })
@@ -193,158 +274,251 @@ export const register: Register = on => {
 
   on('command.run', { command: 'plain' }, async ($, e) => {
     await $.ui.open({ id: PANE, title: TITLE })
-    if (e.args.trim() !== 'now') return { text: 'Plain summary pane opened.' }
-    const current = await read($, turn)
-    $.clock.after(0, () => void summarize($, current?.id ?? 'manual', current?.ask ?? ''))
-
-    return { text: 'Plain summary pane opened. A summary of the last turn is on its way.' }
-  })
-
-  on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined && e.text !== '') {
-      const fresh: Turn = { id: e.turnId, ask: e.text, steps: 0, at: await $.clock.now() }
-      await update($, turn, () => fresh)
-      await update($, turns, list => [...list, fresh].slice(-50))
-      scheduleSave($)
+    const [word, value] = e.args.trim().split(/\s+/)
+    if (word === 'model') {
+      if (!MODELS.includes(value ?? '')) return { text: `Summary model: ${await chosenModel($)}. Choose one of: ${MODELS.join(', ')}.` }
+      await $.store.set('model', value)
+      return { text: `New summaries use ${value}.` }
+    }
+    if (word === 'now') {
+      const fold = await current($)
+      if (fold === undefined) return { text: 'Nothing to summarise yet.' }
+      $.clock.after(0, () => void summarize($, fold.id))
+      return { text: 'A new summary of the newest fold is on its way.' }
     }
 
-    return next(e)
+    return { text: 'Plain summary pane opened.' }
   })
+
+  // A fold starts with each thing the person does: a message, a shell command, a side task.
+  on('prompt.submit', async ($, e, next) => {
+    const result = await next(e)
+    if (e.command !== undefined || !HUMAN_ORIGINS.has(e.origin.kind)) return result
+    const found = classify(e.text)
+    if (found === undefined || (e.isMeta === true && found.kind !== 'task')) return result
+    const at = await $.clock.now()
+    const fold: Fold = { id: `f${at}`, kind: found.kind, at, you: found.you, steps: [], says: [], isWorking: found.kind !== 'ran' }
+    await update($, folds, list => [...list, fold].slice(-KEEP_FOLDS))
+    // The newest fold opens by default, so a new one clears any choice made on it.
+    await update($, closed, list => list.filter(one => one !== fold.id))
+    scheduleSave($)
+
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // The rows the conversation keeps: Claude's text, for summarising and "Show full reply".
+  on('session.append', async ($, e, next) => {
+    const stored = await next(e)
+    if (e.agentId !== undefined) return stored
+    const fold = await current($)
+    if (fold === undefined) return stored
+    if (e.door === 'prompt' && fold.rowId === undefined && HUMAN_ORIGINS.has(e.origin.kind)) {
+      await changeFold($, fold.id, one => ({ ...one, rowId: e.uuid }))
+    }
+    if (e.door === 'response' && e.message.role === 'assistant') {
+      const text = textOf(e.message.content)
+      if (text !== '') {
+        const say: Say = { text, rowId: e.uuid, at: await $.clock.now() }
+        await changeFold($, fold.id, one => ({ ...one, says: [...one.says, say] }))
+      }
+    }
+
+    return stored
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', async ($, e, next) => {
-    const current = await read($, turn)
-    if (current !== null) {
-      const fields = e as unknown as Record<string, unknown>
-      const step: Step = {
-        id: e.tool_use_id,
-        turnId: current.id,
-        raw: rawLine(fields),
-        isHelper: e.agentId !== undefined,
-        at: await $.clock.now(),
-      }
-      argsById.set(step.id, `${e.tool} ${toolArgs(fields)}`)
-      await update($, steps, list => [...list, step].slice(-300))
-      await update($, turn, t => (t === null ? t : { ...t, steps: t.steps + 1 }))
-      scheduleNarrate($)
-      scheduleSave($)
+    const fold = await current($)
+    if (fold === undefined) return next(e)
+    const fields = e as unknown as Record<string, unknown>
+    const step: Step = {
+      id: e.tool_use_id,
+      tool: String(e.tool),
+      label: stepLabel(fields),
+      args: stepArgs(fields),
+      isHelper: e.agentId !== undefined,
+      at: await $.clock.now(),
     }
+    await changeFold($, fold.id, one => ({ ...one, steps: [...one.steps, step].slice(-400) }))
+    const ran = await next(e)
+    const out = ran as unknown as { text?: unknown; isError?: unknown; deny?: unknown }
+    const result = typeof out.text === 'string' ? out.text.slice(0, 300) : typeof out.deny === 'string' ? `Denied: ${out.deny}` : undefined
+    const isError = out.isError === true || typeof out.deny === 'string'
+    await changeFold($, fold.id, one => ({
+      ...one,
+      steps: one.steps.map(s => (s.id === step.id ? { ...s, result, isError } : s)),
+    }))
 
-    return next(e)
-  })
+    return ran
+  }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId !== undefined || e.answer === '') return done
-    const current = await read($, turn)
-    const isSmall = (current?.steps ?? 0) === 0 && e.answer.length < SMALL_ANSWER
-    if (current !== null && !isSmall) {
-      // The fork needs the turn fully ended, so it starts just after this hook.
-      $.clock.after(250, () => void summarize($, current.id, current.ask))
-    }
+    if (e.agentId !== undefined) return done
+    const fold = await current($)
+    if (fold === undefined) return done
+    await changeFold($, fold.id, one => ({ ...one, isWorking: false }))
+    // The summary waits until the turn has fully ended.
+    $.clock.after(250, () => void summarize($, fold.id))
 
     return done
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
-    const list = await read($, summaries)
-    const back = Math.min(await read($, shown), Math.max(0, list.length - 1))
-    const summary = list[list.length - 1 - back]
-    const busy = await read($, isSummarizing)
-    const current = await read($, turn)
-    const allSteps = await read($, steps)
-    const active = await read($, tab)
-    const latest = allSteps[allSteps.length - 1]
+    const list = await read($, folds)
+    const busy = await read($, summarizing)
+    const openList = await read($, opened)
+    const closedList = await read($, closed)
+    const groupsOpen = await read($, openGroups)
+    const shown = await read($, shownCmds)
+    const newest = list[list.length - 1]
+    const isOpen = (fold: Fold) => (fold.id === newest?.id ? !closedList.includes(fold.id) : openList.includes(fold.id))
+    const allOpen = list.length > 0 && list.every(isOpen)
 
-    // A timeline row: the time, a glyph on the rail, then the words.
-    const row = (key: string, at: number, glyph: string, words: string, dim = false, bold = false) => (
-      <Box key={key} flexDirection="row" gap={1}>
-        <Box width={8} flexShrink={0}>
-          <Text dimColor>{clockTime(at)}</Text>
-        </Box>
-        <Box width={1} flexShrink={0}>
-          <Text dimColor={dim}>{glyph}</Text>
-        </Box>
-        <Box flexShrink={1}>
-          <Text dimColor={dim} bold={bold}>
-            {words}
-          </Text>
-        </Box>
-      </Box>
-    )
+    const toggleFold = (fold: Fold) =>
+      fold.id === newest?.id ? update($, closed, l => toggleIn(l, fold.id)) : update($, opened, l => toggleIn(l, fold.id))
 
-    const tabs = (
-      <Box flexDirection="row" gap={1}>
-        <Button
-          key="tab-summary"
-          label="Summary"
-          variant={active === 'summary' ? 'primary' : 'secondary'}
-          onPress={() => update($, tab, () => 'summary')}
-        />
-        <Button
-          key="tab-timeline"
-          label={`Timeline (${allSteps.length})`}
-          variant={active === 'timeline' ? 'primary' : 'secondary'}
-          onPress={() => update($, tab, () => 'timeline')}
-        />
-      </Box>
-    )
+    const toggleAll = async () => {
+      if (allOpen) {
+        await update($, opened, () => [])
+        if (newest) await update($, closed, () => [newest.id])
+      } else {
+        await update($, opened, () => list.map(fold => fold.id))
+        await update($, closed, () => [])
+      }
+      scheduleSave($)
+    }
 
-    if (active === 'timeline') {
-      const allTurns = await read($, turns)
-      const limit = await read($, timelineTurns)
-      const visible = allTurns.slice(-limit).reverse()
+    const toggleShown = (key: string) => update($, shownCmds, l => toggleIn(l, key))
+
+    const groupView = (fold: Fold, group: Group, gi: number) => {
+      const key = `${fold.id}:${gi}`
+      const isProblem = group.status !== 'ok'
+      const isGroupOpen = isProblem ? !groupsOpen.includes(key) : groupsOpen.includes(key)
+      const steps = group.tools.map(i => fold.steps[i]).filter((s): s is Step => s !== undefined)
 
       return (
-        <Box flexDirection="column" gap={1}>
-          {tabs}
-          {busy && <Text dimColor>Writing a summary of the last turn…</Text>}
-          {visible.length === 0 && <Text dimColor>The timeline starts with your next message.</Text>}
-          {visible.map(one => {
-            const ownSteps = allSteps.filter(step => step.turnId === one.id)
-            const at = list.findIndex(s => s.turnId === one.id)
-            const done = list[at]
+        <Box key={`g-${key}`} flexDirection="column" gap={1}>
+          <Box flexDirection="row" gap={1}>
+            <Button key={`gb-${key}`} plain onPress={() => update($, openGroups, l => toggleIn(l, key))}>
+              <Text color={isProblem ? 'error' : 'success'}>{isProblem ? '!' : '✓'}</Text>
+              <Text dimColor>{isGroupOpen ? ' ▾' : ' ▸'}</Text>
+            </Button>
+            <Box flexShrink={1} flexDirection="column">
+              <Text wrap="wrap">{group.title}</Text>
+              <Text dimColor size="caption">{`${steps.length} step${steps.length === 1 ? '' : 's'}`}</Text>
+            </Box>
+          </Box>
+          {isProblem && group.note !== undefined && (
+            <Box paddingLeft={4}>
+              <Text color="error" wrap="wrap">
+                {group.note}
+              </Text>
+            </Box>
+          )}
+          {isGroupOpen && (
+            <Box flexDirection="column" paddingLeft={4} gap={1}>
+              {steps.map(step => (
+                <Box key={`s-${step.id}`} flexDirection="column">
+                  <Text wrap="wrap">
+                    <Text dimColor>{`${clockTime(step.at)}  `}</Text>
+                    {step.label}
+                    {step.isError ? <Text color="error">{'  (error)'}</Text> : ''}
+                  </Text>
+                  <Button key={`sc-${step.id}`} plain dimColor onPress={() => toggleShown(step.id)}>
+                    {shown.includes(step.id) ? 'Hide command' : 'Show command'}
+                  </Button>
+                  {shown.includes(step.id) && (
+                    <Box paddingLeft={2}>
+                      <Text mono dimColor wrap="wrap">
+                        {step.args}
+                      </Text>
+                    </Box>
+                  )}
+                </Box>
+              ))}
+            </Box>
+          )}
+        </Box>
+      )
+    }
 
-            return (
-              <Box key={`turn-${one.id}`} flexDirection="column">
-                {row(`ask-${one.id}`, one.at, '◆', `You: ${one.ask.replace(/\s+/g, ' ').slice(0, 160)}`, false, true)}
-                {ownSteps.map(step =>
-                  row(
-                    `step-${step.id}`,
-                    step.at,
-                    step.plain === undefined ? '○' : step.isHelper ? '↳' : '●',
-                    step.plain ?? step.raw,
-                    step.plain === undefined,
-                  ),
-                )}
-                {ownSteps.length === 0 && row(`none-${one.id}`, one.at, '│', 'No tool calls.', true)}
-                {done !== undefined && (
-                  <Box flexDirection="row" gap={1}>
-                    <Box width={8} flexShrink={0}>
-                      <Text dimColor>{clockTime(done.at)}</Text>
-                    </Box>
-                    <Box width={1} flexShrink={0}>
-                      <Text>✓</Text>
-                    </Box>
-                    <Button
-                      key={`read-${one.id}`}
-                      label="Read summary"
-                      onPress={async () => {
-                        await update($, shown, () => list.length - 1 - at)
-                        await update($, tab, () => 'summary')
-                      }}
-                    />
-                  </Box>
-                )}
-              </Box>
-            )
-          })}
-          {allTurns.length > limit && (
-            <Button
-              key="show-older"
-              label="Show older turns"
-              onPress={() => update($, timelineTurns, n => n + TIMELINE_PAGE)}
-            />
+    const foldView = (fold: Fold) => {
+      const isFoldOpen = isOpen(fold)
+      const summary = fold.summary
+      const isBusy = busy.includes(fold.id)
+      const latest = fold.steps[fold.steps.length - 1]
+      const problem = summary?.groups.find(g => g.status !== 'ok')
+      const originalKey = `original:${fold.id}`
+      const original = fold.says.map(say => say.text).join('\n\n')
+      const status = fold.isWorking
+        ? `Working: ${latest?.label ?? 'thinking'}`
+        : isBusy
+          ? 'Writing the summary…'
+          : summary !== undefined
+            ? `→ ${summary.outcome}`
+            : fold.kind === 'ran'
+              ? '→ Done.'
+              : ''
+
+      return (
+        <Box key={`f-${fold.id}`} flexDirection="column" marginBottom={2} gap={1}>
+          <Box flexDirection="row" gap={1}>
+            <Button key={`fb-${fold.id}`} plain onPress={() => toggleFold(fold)}>
+              <Text dimColor>{`${clockTime(fold.at)} `}</Text>
+              <Text color={fold.id === newest?.id ? 'claude' : 'text'}>{GLYPH[fold.kind]}</Text>
+              <Text dimColor>{isFoldOpen ? ' ▾' : ' ▸'}</Text>
+            </Button>
+            <Box flexShrink={1}>
+              <Text bold={fold.kind === 'msg'} wrap="wrap">
+                {fold.you.length > 300 ? `${fold.you.slice(0, 297)}…` : fold.you}
+              </Text>
+            </Box>
+          </Box>
+          <Box flexDirection="column" paddingLeft={4}>
+            {fold.id === newest?.id && (
+              <Text size="caption" color="claude">
+                Since your last message
+              </Text>
+            )}
+            {status !== '' && (
+              <Text dimColor={fold.isWorking || isBusy} wrap="wrap">
+                {status}
+              </Text>
+            )}
+            {problem !== undefined && <Text color="error">{problem.status}</Text>}
+          </Box>
+          {isFoldOpen && summary !== undefined && (
+            <Box flexDirection="column" paddingLeft={4} gap={1}>
+              {summary.groups.map((group, gi) => groupView(fold, group, gi))}
+              {summary.reply.length > 0 && (
+                <Box flexDirection="column" gap={1}>
+                  <Text dimColor size="caption">
+                    Claude replied
+                  </Text>
+                  {summary.reply.map((line, li) => (
+                    <Text key={`r-${fold.id}-${li}`} wrap="wrap">
+                      {line}
+                    </Text>
+                  ))}
+                </Box>
+              )}
+              {original !== '' && (
+                <Box flexDirection="column" gap={1}>
+                  <Button key={`ob-${fold.id}`} plain onPress={() => toggleShown(originalKey)}>
+                    <Text color="suggestion">{shown.includes(originalKey) ? 'Hide full reply' : 'Show full reply'}</Text>
+                  </Button>
+                  {shown.includes(originalKey) && <Markdown key={`om-${fold.id}`} text={original} />}
+                </Box>
+              )}
+            </Box>
+          )}
+          {isFoldOpen && summary === undefined && fold.steps.length > 0 && (
+            <Box flexDirection="column" paddingLeft={4}>
+              {fold.steps.slice(-5).map(step => (
+                <Text key={`ls-${step.id}`} dimColor wrap="wrap">{`${clockTime(step.at)}  ${step.label}`}</Text>
+              ))}
+            </Box>
           )}
         </Box>
       )
@@ -352,43 +526,15 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1}>
-        {tabs}
-        {busy && <Text dimColor>Writing a summary of the last turn…</Text>}
-        {latest !== undefined && current !== null && latest.turnId === current.id && (
-          <Box flexDirection="column">
-            <Text bold>Now</Text>
-            {row('now', latest.at, latest.plain === undefined ? '○' : '●', latest.plain ?? latest.raw, latest.plain === undefined)}
-          </Box>
-        )}
-
-        <Box flexDirection="column">
-          <Text bold>
-            Summary{summary !== undefined ? ` · ${clockTime(summary.at)}` : ''}
-            {list.length > 1 ? ` (${back + 1} of ${list.length}, newest first)` : ''}
-          </Text>
-          {summary === undefined ? (
-            <Text dimColor>A summary shows here after Claude finishes a turn.</Text>
-          ) : (
-            <Markdown key={`summary-${summary.turnId}-${summary.at}`} text={summary.text} />
+        <Box flexDirection="row" justifyContent="flex-end">
+          {list.length > 0 && (
+            <Button key="all" plain onPress={toggleAll}>
+              <Text color="suggestion">{allOpen ? 'Fold all' : 'Open all'}</Text>
+            </Button>
           )}
         </Box>
-
-        <Box flexDirection="row" gap={1}>
-          {back < list.length - 1 && (
-            <Button key="older" label="Older" onPress={() => update($, shown, n => n + 1)} />
-          )}
-          {back > 0 && <Button key="newer" label="Newer" onPress={() => update($, shown, n => n - 1)} />}
-          {summary !== undefined && (
-            <Button
-              key="copy"
-              label="Copy"
-              onPress={press => void $.ui.copy({ text: summary.text, surface: press.surface })}
-            />
-          )}
-          {summary === undefined && current !== null && (
-            <Button key="now-summary" label="Summarize now" onPress={() => void summarize($, current.id, current.ask)} />
-          )}
-        </Box>
+        {list.length === 0 && <Text dimColor>Your next message starts the timeline.</Text>}
+        {list.map(foldView)}
       </Box>
     )
   })
