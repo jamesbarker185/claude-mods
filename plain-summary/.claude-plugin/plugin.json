@@ -1,6 +1,6 @@
 {
   "name": "plain-summary",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A side pane that folds each thing you did and what Claude did after it into one plain line",
   "types": "./types/index.d.ts"
 }
