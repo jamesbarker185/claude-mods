@@ -25,15 +25,8 @@ claude plugin install plain-summary --marketplace jamesbarker185/claude-mods
 
 In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `jamesbarker185/claude-mods`, then Add plugin.
 
-## Cloud sessions
+## Where it works
 
-A cloud session loads plugins named in the project's `.claude/settings.json`. Add:
+Plain summary works in local sessions: `claude` in a terminal, the Code tab of the Claude Desktop app, and the VS Code extension.
 
-```json
-{
-  "extraKnownMarketplaces": {
-    "claude-mods": { "source": { "source": "github", "repo": "jamesbarker185/claude-mods" } }
-  },
-  "enabledPlugins": { "plain-summary@claude-mods": true }
-}
-```
+It doesn't work in cloud sessions (claude.ai/code, the mobile app, or a cloud session started from the Desktop app). A cloud session doesn't install plugins that a repository turns on in `.claude/settings.json`, and it doesn't show what a mod draws, such as this pane. See [Where mods run](https://code.claude.com/docs/en/plugins/mods/overview#where-mods-run) and [What carries over](https://code.claude.com/docs/en/cloud-environments). To use the pane on a repository, open a local session on it.
