@@ -1,0 +1,16 @@
+{
+  "name": "ste-summary",
+  "version": "0.2.0",
+  "description": "After each reply, a Sonnet summary of the latest exchange in ASD-STE100 Simplified Technical English, shown in the chat",
+  "author": {
+    "name": "jamesbarker185"
+  },
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Summary model",
+      "description": "Model alias or id that writes the STE summary",
+      "default": "sonnet"
+    }
+  }
+}

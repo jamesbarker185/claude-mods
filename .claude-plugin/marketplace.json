@@ -1,5 +1,16 @@
 {
   "name": "claude-mods",
-  "owner": { "name": "jamesbarker185" },
-  "plugins": [{ "name": "plain-summary", "source": "./plain-summary" }]
+  "owner": {
+    "name": "jamesbarker185"
+  },
+  "plugins": [
+    {
+      "name": "plain-summary",
+      "source": "./plain-summary"
+    },
+    {
+      "name": "ste-summary",
+      "source": "./ste-summary"
+    }
+  ]
 }

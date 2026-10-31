@@ -30,3 +30,20 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 Plain summary works in local sessions: `claude` in a terminal, the Code tab of the Claude Desktop app, and the VS Code extension.
 
 It doesn't work in cloud sessions (claude.ai/code, the mobile app, or a cloud session started from the Desktop app). A cloud session doesn't install plugins that a repository turns on in `.claude/settings.json`, and it doesn't show what a mod draws, such as this pane. See [Where mods run](https://code.claude.com/docs/en/plugins/mods/overview#where-mods-run) and [What carries over](https://code.claude.com/docs/en/cloud-environments). To use the pane on a repository, open a local session on it.
+
+# ste-summary
+
+A Claude Code mod that adds a one-line summary under each of Claude's replies, written in ASD-STE100 Simplified Technical English. The summary covers your latest prompt and Claude's answer to it. It is not added to Claude's context.
+
+- Sonnet writes the summary when Claude's turn ends (one call per reply). Subagent turns, interrupted turns and refusals get no summary.
+- The summary shows as one line of plain text that starts with `STE:`. Line breaks and Markdown are removed, because the chat draws this line as plain text.
+- `/ste off` and `/ste on` turn the summaries off and on (kept across sessions); `/ste now` summarizes the latest exchange at once; `/ste` says whether it is on.
+- The `model` option sets the summary model (default `sonnet`).
+
+## Install
+
+```bash
+claude plugin install ste-summary --marketplace jamesbarker185/claude-mods
+```
+
+In the desktop app: click + next to the prompt box, then Plugins, Add marketplace with `jamesbarker185/claude-mods`, then Add plugin. Like plain-summary, it works in local sessions only.
